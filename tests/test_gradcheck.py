@@ -14,7 +14,9 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from metalgrad.ops import matmul, rms_norm, conv1d, conv2d, depthwise_conv2d, layer_norm
+from metalgrad.ops import (
+    matmul, rms_norm, conv1d, conv2d, depthwise_conv2d, layer_norm, attention,
+)
 from metalgrad.testing import gradcheck
 
 
@@ -211,6 +213,65 @@ def test_layer_norm_vjp_vs_ref():
         assert rel < 1e-5, f"layer_norm g{name} rel err {rel:.2e}"
 
 
+# ─── attention ───────────────────────────────────────────────────────────────
+
+def test_attention_gradcheck_small():
+    # Tiny shape so fp32 finite-diff stays clean.
+    B, H, T, D = 1, 2, 4, 8
+    q = _arr(B, H, T, D, seed=35)
+    k = _arr(B, H, T, D, seed=36)
+    v = _arr(B, H, T, D, seed=37)
+    scale = 1.0 / (D ** 0.5)
+    gradcheck(
+        lambda q, k, v: mx.sum(attention(q, k, v, scale=scale) ** 2),
+        [q, k, v], argnums=(0, 1, 2), rtol=5e-2, atol=1e-2, sample=32,
+    )
+
+
+def test_attention_vjp_vs_ref():
+    """Our wrapper VJP matches mx.fast.SDPA's built-in VJP exactly."""
+    B, H, T, D = 2, 4, 8, 16
+    q = _arr(B, H, T, D, seed=38)
+    k = _arr(B, H, T, D, seed=39)
+    v = _arr(B, H, T, D, seed=40)
+    scale = 1.0 / (D ** 0.5)
+
+    def ours(q, k, v): return mx.sum(attention(q, k, v, scale=scale) ** 2)
+    def ref(q, k, v):
+        return mx.sum(mx.fast.scaled_dot_product_attention(q, k, v, scale=scale) ** 2)
+
+    g_o = mx.grad(ours, argnums=(0, 1, 2))(q, k, v)
+    g_r = mx.grad(ref,  argnums=(0, 1, 2))(q, k, v)
+    mx.eval(*g_o, *g_r)
+    for i, name in enumerate("qkv"):
+        rel = float(mx.abs(g_o[i] - g_r[i]).max()) / max(float(mx.abs(g_r[i]).max()), 1e-9)
+        assert rel < 1e-5, f"attention g{name} rel err {rel:.2e}"
+
+
+def test_attention_with_mask_vjp_vs_ref():
+    B, H, T, D = 1, 2, 6, 8
+    q = _arr(B, H, T, D, seed=41)
+    k = _arr(B, H, T, D, seed=42)
+    v = _arr(B, H, T, D, seed=43)
+    # Causal mask: -inf above diagonal, 0 elsewhere. Same shape mx expects.
+    mask = mx.array(np.where(
+        np.tri(T, T, dtype=bool).reshape(1, 1, T, T), 0.0, -1e9
+    ).astype(np.float32))
+    scale = 1.0 / (D ** 0.5)
+
+    def ours(q, k, v): return mx.sum(attention(q, k, v, scale=scale, mask=mask) ** 2)
+    def ref(q, k, v):
+        return mx.sum(mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=scale, mask=mask) ** 2)
+
+    g_o = mx.grad(ours, argnums=(0, 1, 2))(q, k, v)
+    g_r = mx.grad(ref,  argnums=(0, 1, 2))(q, k, v)
+    mx.eval(*g_o, *g_r)
+    for i, name in enumerate("qkv"):
+        rel = float(mx.abs(g_o[i] - g_r[i]).max()) / max(float(mx.abs(g_r[i]).max()), 1e-9)
+        assert rel < 1e-5, f"attention(mask) g{name} rel err {rel:.2e}"
+
+
 if __name__ == "__main__":
     test_matmul_gradcheck_2d()
     test_matmul_gradcheck_batched()
@@ -225,4 +286,7 @@ if __name__ == "__main__":
     test_depthwise_conv2d_vjp_vs_ref()
     test_layer_norm_gradcheck()
     test_layer_norm_vjp_vs_ref()
+    test_attention_gradcheck_small()
+    test_attention_vjp_vs_ref()
+    test_attention_with_mask_vjp_vs_ref()
     print("ALL PASS")

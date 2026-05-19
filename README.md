@@ -50,6 +50,7 @@ from metalgrad.ops import matmul, rms_norm
 | `conv2d` | `mx.conv2d` | custom Metal kernel | ✓ via `mx.vjp` |
 | `depthwise_conv2d` | `mx.conv2d` (groups=C) | ConvNeXt K=7 dedicated kernel | ✓ via `mx.vjp` |
 | `layer_norm` | mx ops | fused Metal kernel | ✓ via `mx.vjp` |
+| `attention` | `mx.fast.scaled_dot_product_attention` | FlashAttention-style Metal kernel | ✓ via `mx.vjp` |
 
 The v0.0.1 ops use mx-based forwards to establish the framework and
 pass gradcheck end-to-end. Custom Metal kernels land in v0.0.2 without
