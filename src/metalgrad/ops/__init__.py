@@ -22,6 +22,13 @@ from metalgrad.ops.attention import attention
 from metalgrad.ops.activations import swiglu, geglu, squared_relu
 from metalgrad.ops.swiglu_ffn import swiglu_ffn, swiglu_ffn_unfused, stack_gate_up
 from metalgrad.ops.cross_entropy import cross_entropy
+from metalgrad.ops.mse import mse
+from metalgrad.ops.kl_div import kl_div_logits
+from metalgrad.ops.rope import (
+    rope_freqs_standard, rope_freqs_linear_pi, rope_freqs_ntk_aware,
+    rope_freqs_yarn, rope_freqs_llama3,
+    rope_standard, rope_linear_pi, rope_ntk_aware, rope_yarn, rope_llama3,
+)
 
 __all__ = [
     "matmul", "rms_norm",
@@ -30,5 +37,9 @@ __all__ = [
     "attention",
     "swiglu", "geglu", "squared_relu",
     "swiglu_ffn", "swiglu_ffn_unfused", "stack_gate_up",
-    "cross_entropy",
+    "cross_entropy", "mse", "kl_div_logits",
+    "rope_freqs_standard", "rope_freqs_linear_pi", "rope_freqs_ntk_aware",
+    "rope_freqs_yarn", "rope_freqs_llama3",
+    "rope_standard", "rope_linear_pi", "rope_ntk_aware",
+    "rope_yarn", "rope_llama3",
 ]

@@ -16,7 +16,8 @@ import numpy as np
 
 from metalgrad.ops import (
     matmul, rms_norm, conv1d, conv2d, depthwise_conv2d, layer_norm, attention,
-    swiglu, geglu, squared_relu, cross_entropy,
+    swiglu, geglu, squared_relu, cross_entropy, mse, kl_div_logits,
+    rope_standard, rope_llama3, rope_yarn,
 )
 from metalgrad.testing import gradcheck
 
@@ -378,6 +379,84 @@ def test_cross_entropy_gradcheck_finite_diff():
     )
 
 
+# ─── mse ─────────────────────────────────────────────────────────────────────
+
+def test_mse_value_vs_ref():
+    p = _arr(4, 16, seed=63)
+    t = _arr(4, 16, seed=64)
+    v_ours = float(mse(p, t))
+    v_ref = float(mx.mean((p - t) ** 2))
+    assert abs(v_ours - v_ref) < 1e-5
+
+
+def test_mse_grad_vs_ref():
+    p = _arr(4, 16, seed=65)
+    t = _arr(4, 16, seed=66)
+    g_o = mx.grad(lambda p: mse(p, t))(p)
+    g_r = mx.grad(lambda p: mx.mean((p - t) ** 2))(p)
+    mx.eval(g_o, g_r)
+    rel = float(mx.abs(g_o - g_r).max()) / max(float(mx.abs(g_r).max()), 1e-9)
+    assert rel < 1e-5, f"mse grad rel err {rel:.2e}"
+
+
+# ─── kl_div_logits ───────────────────────────────────────────────────────────
+
+def test_kl_div_value_vs_ref():
+    N, V = 16, 64
+    rng = np.random.default_rng(67)
+    p = mx.array((rng.standard_normal((N, V)) * 0.5).astype(np.float32))
+    t = mx.array((rng.standard_normal((N, V)) * 0.5).astype(np.float32))
+
+    def kl_ref(p_logits, t_logits):
+        log_q = p_logits - mx.logsumexp(p_logits, axis=-1, keepdims=True)
+        log_p = t_logits - mx.logsumexp(t_logits, axis=-1, keepdims=True)
+        return mx.mean(mx.sum(mx.exp(log_p) * (log_p - log_q), axis=-1))
+
+    v_o = float(kl_div_logits(p, t))
+    v_r = float(kl_ref(p, t))
+    assert abs(v_o - v_r) < 1e-4, f"kl value: ours {v_o}, ref {v_r}"
+
+
+def test_kl_div_grad_vs_ref():
+    N, V = 16, 64
+    rng = np.random.default_rng(68)
+    p = mx.array((rng.standard_normal((N, V)) * 0.5).astype(np.float32))
+    t = mx.array((rng.standard_normal((N, V)) * 0.5).astype(np.float32))
+
+    def kl_ref(p_logits, t_logits):
+        log_q = p_logits - mx.logsumexp(p_logits, axis=-1, keepdims=True)
+        log_p = t_logits - mx.logsumexp(t_logits, axis=-1, keepdims=True)
+        return mx.mean(mx.sum(mx.exp(log_p) * (log_p - log_q), axis=-1))
+
+    # Grad w.r.t. pred only (target is the teacher, treated as constant)
+    g_o = mx.grad(lambda p: kl_div_logits(p, t))(p)
+    g_r = mx.grad(lambda p: kl_ref(p, t))(p)
+    mx.eval(g_o, g_r)
+    rel = float(mx.abs(g_o - g_r).max()) / max(float(mx.abs(g_r).max()), 1e-9)
+    assert rel < 1e-4, f"kl_div_logits grad rel err {rel:.2e}"
+
+
+# ─── rope variants (correctness only; no grad win to test) ───────────────────
+
+def test_rope_variants_finite():
+    """Just check the new RoPE variants produce finite outputs of the
+    expected shape. The math equivalence to mx.fast.rope with the right
+    freqs is by construction."""
+    rng = np.random.default_rng(69)
+    B, H, T, D = 1, 2, 16, 32
+    x = mx.array(rng.standard_normal((B, H, T, D)).astype(np.float32) * 0.3)
+
+    for fn in [
+        lambda x: rope_standard(x, D),
+        lambda x: rope_llama3(x, D, original_max_pos=64),
+        lambda x: rope_yarn(x, D, original_max_pos=64),
+    ]:
+        y = fn(x)
+        mx.eval(y)
+        assert y.shape == x.shape
+        assert bool(mx.all(mx.isfinite(y))), "non-finite RoPE output"
+
+
 if __name__ == "__main__":
     test_matmul_gradcheck_2d()
     test_matmul_gradcheck_batched()
@@ -403,4 +482,9 @@ if __name__ == "__main__":
     test_cross_entropy_value_vs_ref()
     test_cross_entropy_grad_vs_ref()
     test_cross_entropy_gradcheck_finite_diff()
+    test_mse_value_vs_ref()
+    test_mse_grad_vs_ref()
+    test_kl_div_value_vs_ref()
+    test_kl_div_grad_vs_ref()
+    test_rope_variants_finite()
     print("ALL PASS")
