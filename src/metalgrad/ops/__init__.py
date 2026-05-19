@@ -19,10 +19,12 @@ from metalgrad.ops.conv2d import conv2d
 from metalgrad.ops.depthwise_conv2d import depthwise_conv2d
 from metalgrad.ops.layer_norm import layer_norm
 from metalgrad.ops.attention import attention
+from metalgrad.ops.activations import swiglu, geglu, squared_relu
 
 __all__ = [
     "matmul", "rms_norm",
     "conv1d", "conv2d", "depthwise_conv2d",
     "layer_norm",
     "attention",
+    "swiglu", "geglu", "squared_relu",
 ]

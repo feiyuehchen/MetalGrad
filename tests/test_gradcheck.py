@@ -16,6 +16,7 @@ import numpy as np
 
 from metalgrad.ops import (
     matmul, rms_norm, conv1d, conv2d, depthwise_conv2d, layer_norm, attention,
+    swiglu, geglu, squared_relu,
 )
 from metalgrad.testing import gradcheck
 
@@ -272,6 +273,61 @@ def test_attention_with_mask_vjp_vs_ref():
         assert rel < 1e-5, f"attention(mask) g{name} rel err {rel:.2e}"
 
 
+# ─── activations ─────────────────────────────────────────────────────────────
+
+def test_swiglu_gradcheck():
+    a = _arr(2, 16, seed=50)
+    b = _arr(2, 16, seed=51)
+    gradcheck(
+        lambda a, b: mx.sum(swiglu(a, b) ** 2),
+        [a, b], rtol=5e-2, atol=1e-2, sample=32,
+    )
+
+
+def test_swiglu_vjp_vs_ref():
+    a = _arr(8, 32, seed=52)
+    b = _arr(8, 32, seed=53)
+
+    def ref_fwd(a, b): return (a * mx.sigmoid(a)) * b
+    def ours(a, b): return mx.sum(swiglu(a, b) ** 2)
+    def ref(a, b):  return mx.sum(ref_fwd(a, b) ** 2)
+    g_o = mx.grad(ours, argnums=(0, 1))(a, b)
+    g_r = mx.grad(ref,  argnums=(0, 1))(a, b)
+    mx.eval(*g_o, *g_r)
+    for i, name in enumerate("ab"):
+        rel = float(mx.abs(g_o[i] - g_r[i]).max()) / max(float(mx.abs(g_r[i]).max()), 1e-9)
+        assert rel < 1e-5, f"swiglu g{name} rel err {rel:.2e}"
+
+
+def test_geglu_gradcheck():
+    a = _arr(2, 16, seed=54)
+    b = _arr(2, 16, seed=55)
+    gradcheck(
+        lambda a, b: mx.sum(geglu(a, b) ** 2),
+        [a, b], rtol=5e-2, atol=1e-2, sample=32,
+    )
+
+
+def test_squared_relu_gradcheck():
+    x = _arr(4, 16, seed=56)
+    gradcheck(
+        lambda x: mx.sum(squared_relu(x) ** 2),
+        [x], rtol=5e-2, atol=1e-2, sample=32,
+    )
+
+
+def test_squared_relu_vjp_vs_ref():
+    x = _arr(4, 16, seed=57)
+
+    def ours(x): return mx.sum(squared_relu(x) ** 2)
+    def ref(x):  return mx.sum((mx.maximum(x, 0) ** 2) ** 2)
+    g_o = mx.grad(ours)(x)
+    g_r = mx.grad(ref)(x)
+    mx.eval(g_o, g_r)
+    rel = float(mx.abs(g_o - g_r).max()) / max(float(mx.abs(g_r).max()), 1e-9)
+    assert rel < 1e-5, f"squared_relu rel err {rel:.2e}"
+
+
 if __name__ == "__main__":
     test_matmul_gradcheck_2d()
     test_matmul_gradcheck_batched()
@@ -289,4 +345,9 @@ if __name__ == "__main__":
     test_attention_gradcheck_small()
     test_attention_vjp_vs_ref()
     test_attention_with_mask_vjp_vs_ref()
+    test_swiglu_gradcheck()
+    test_swiglu_vjp_vs_ref()
+    test_geglu_gradcheck()
+    test_squared_relu_gradcheck()
+    test_squared_relu_vjp_vs_ref()
     print("ALL PASS")

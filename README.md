@@ -42,15 +42,19 @@ training without losing autograd support.
 from metalgrad.ops import matmul, rms_norm
 ```
 
-| op | Forward (v0.0.1) | Forward (v0.0.2+) | VJP |
-|---|---|---|---|
-| `matmul` | `mx.matmul` | custom `simdgroup_matrix` GEMM | ✓ explicit |
-| `rms_norm` | mx ops | fused TG-cooperative reduction kernel | ✓ explicit |
-| `conv1d` | `mx.conv1d` | custom Metal float4+fma kernel | ✓ via `mx.vjp` |
-| `conv2d` | `mx.conv2d` | custom Metal kernel | ✓ via `mx.vjp` |
-| `depthwise_conv2d` | `mx.conv2d` (groups=C) | ConvNeXt K=7 dedicated kernel | ✓ via `mx.vjp` |
-| `layer_norm` | mx ops | fused Metal kernel | ✓ via `mx.vjp` |
-| `attention` | `mx.fast.scaled_dot_product_attention` | FlashAttention-style Metal kernel | ✓ via `mx.vjp` |
+| op | Forward speed vs `mx` | Notes |
+|---|---:|---|
+| `matmul` | 1.0× | `mx.matmul` is already MPSGraph-tuned |
+| **`rms_norm`** | **1.91×** ✓ | fused TG-cooperative SIMD reduction (v0.0.2) |
+| `conv1d` | 1.0× | `mx.conv1d` baseline |
+| `conv2d` | 1.0× | `mx.conv2d` baseline |
+| `depthwise_conv2d` | 1.0× | naive K=7 kernel lost to mx; disabled. Real kernel = v0.0.3. |
+| **`layer_norm`** | **2.80×** ✓ | fused two-pass reduction (v0.0.2) |
+| `attention` | 1.0× | `mx.fast.scaled_dot_product_attention` |
+| `swiglu` / `geglu` / `squared_relu` | 1.0× | new in v0.0.2, mx-backed forward |
+
+Benched on M3 Pro, FP32, batch shape `(4, 512, 1024)` for the norm ops.
+All ops pass `gradcheck` with `rel_err < 1e-5` vs the mx reference VJP.
 
 The v0.0.1 ops use mx-based forwards to establish the framework and
 pass gradcheck end-to-end. Custom Metal kernels land in v0.0.2 without

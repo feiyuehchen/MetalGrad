@@ -31,16 +31,89 @@ import mlx.core as mx
 from metalgrad.differentiable import differentiable
 
 
-def _rms_forward(x: mx.array, weight: mx.array, eps: float) -> mx.array:
-    """v0.0.1 forward: pure mx implementation.
+_RMS_FWD_SRC = """
+    // Each TG = one SIMD (32 threads), one row (B*T position).
+    // Channels split across the 32 threads: each thread does C/32 channels.
+    // Pass 1: sum x*x across the row (each thread sums its C/32 elements,
+    //         then simd_sum reduces across the SIMD).
+    // Pass 2: each thread writes y = x * inv * weight for its C/32 channels.
+    //
+    // `eps_arr` is a 1-element mx.array; mx.fast.metal_kernel only allows
+    // int / bool / Dtype as template args so we pass float eps via a tiny
+    // input buffer instead of templating it. That preserves bit-exact
+    // numerics when eps is small (e.g. 1e-5).
+    uint row = thread_position_in_grid.y;
+    uint lane = thread_position_in_threadgroup.x;
+    if (row >= N_ROWS) return;
 
-    A real custom Metal kernel goes here in v0.0.2. The kernel pattern is
-    well understood — cooperative simd_sum reduction over the last axis,
-    one TG per row — but ships with v0.0.2 once we have a benchmark
-    target. For now, the framework + VJP correctness are what we are
-    proving; the forward is the easy part to swap later without touching
-    the VJP.
+    int C_PER_LANE = (int)C / 32;
+    uint row_off = row * (uint)C + lane * (uint)C_PER_LANE;
+    float eps = eps_arr[0];
+
+    float sq = 0.0f;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < C_PER_LANE; ++i) {
+        float v = x[row_off + (uint)i];
+        sq = fma(v, v, sq);
+    }
+    float row_sq = simd_sum(sq);
+    float inv = rsqrt(row_sq / float(C) + eps);
+
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < C_PER_LANE; ++i) {
+        uint cidx = lane * (uint)C_PER_LANE + (uint)i;
+        float v = x[row_off + (uint)i];
+        y[row_off + (uint)i] = v * inv * weight[cidx];
+    }
+"""
+
+_rms_kernels: dict = {}
+
+
+def _get_rms_kernel(C: int):
+    k = _rms_kernels.get(C)
+    if k is None:
+        k = mx.fast.metal_kernel(
+            name=f"metalgrad_rms_norm_fwd_C{C}",
+            input_names=["x", "weight", "eps_arr"],
+            output_names=["y"],
+            source=_RMS_FWD_SRC,
+        )
+        _rms_kernels[C] = k
+    return k
+
+
+def _rms_forward(x: mx.array, weight: mx.array, eps: float) -> mx.array:
+    """Fused Metal kernel forward: one TG per row, simd_sum reduction.
+
+    Requires C divisible by 32 (one SIMD group per row, 32 lanes split
+    the channel axis). For other C we fall back to the mx implementation.
     """
+    C = x.shape[-1]
+    if C % 32 != 0 or x.ndim < 2:
+        return _rms_forward_mx(x, weight, eps)
+
+    orig_shape = x.shape
+    n_rows = 1
+    for d in orig_shape[:-1]:
+        n_rows *= d
+    x_flat = x.reshape(n_rows, C)
+    eps_arr = mx.array([float(eps)], dtype=x.dtype)
+
+    kernel = _get_rms_kernel(C)
+    (y_flat,) = kernel(
+        inputs=[x_flat, weight, eps_arr],
+        template=[("C", C), ("N_ROWS", n_rows)],
+        grid=(32, n_rows, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(n_rows, C)],
+        output_dtypes=[x.dtype],
+    )
+    return y_flat.reshape(orig_shape)
+
+
+def _rms_forward_mx(x: mx.array, weight: mx.array, eps: float) -> mx.array:
+    """Pure mx fallback for shapes the kernel does not support."""
     s = mx.mean(x * x, axis=-1, keepdims=True) + eps
     return (x * mx.rsqrt(s)) * weight
 
