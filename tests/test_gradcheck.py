@@ -16,7 +16,7 @@ import numpy as np
 
 from metalgrad.ops import (
     matmul, rms_norm, conv1d, conv2d, depthwise_conv2d, layer_norm, attention,
-    swiglu, geglu, squared_relu,
+    swiglu, geglu, squared_relu, cross_entropy,
 )
 from metalgrad.testing import gradcheck
 
@@ -328,6 +328,56 @@ def test_squared_relu_vjp_vs_ref():
     assert rel < 1e-5, f"squared_relu rel err {rel:.2e}"
 
 
+# ─── cross_entropy ───────────────────────────────────────────────────────────
+
+def test_cross_entropy_value_vs_ref():
+    N, V = 32, 128
+    rng = np.random.default_rng(60)
+    logits = mx.array((rng.standard_normal((N, V)) * 0.5).astype(np.float32))
+    labels = mx.array(rng.integers(0, V, N).astype(np.int32))
+
+    def ref(l, lb):
+        lse = mx.logsumexp(l, axis=-1)
+        lab = mx.take_along_axis(l, lb[:, None], axis=-1).squeeze(-1)
+        return mx.mean(lse - lab)
+
+    v_ours = float(cross_entropy(logits, labels))
+    v_ref = float(ref(logits, labels))
+    assert abs(v_ours - v_ref) < 1e-5, f"value: ours {v_ours}, ref {v_ref}"
+
+
+def test_cross_entropy_grad_vs_ref():
+    """Our grad kernel matches mx.grad of the mx reference to FP32 precision."""
+    N, V = 32, 256
+    rng = np.random.default_rng(61)
+    logits = mx.array((rng.standard_normal((N, V)) * 0.5).astype(np.float32))
+    labels = mx.array(rng.integers(0, V, N).astype(np.int32))
+
+    def ref(l, lb):
+        lse = mx.logsumexp(l, axis=-1)
+        lab = mx.take_along_axis(l, lb[:, None], axis=-1).squeeze(-1)
+        return mx.mean(lse - lab)
+
+    g_o = mx.grad(lambda l: cross_entropy(l, labels))(logits)
+    g_r = mx.grad(lambda l: ref(l, labels))(logits)
+    mx.eval(g_o, g_r)
+    rel = float(mx.abs(g_o - g_r).max()) / max(float(mx.abs(g_r).max()), 1e-9)
+    assert rel < 1e-5, f"cross_entropy grad rel err {rel:.2e}"
+
+
+def test_cross_entropy_gradcheck_finite_diff():
+    """Per-element finite-diff vs autograd. Small V so FP32 fd has room."""
+    N, V = 4, 16
+    rng = np.random.default_rng(62)
+    logits = mx.array((rng.standard_normal((N, V)) * 0.3).astype(np.float32))
+    labels = mx.array(rng.integers(0, V, N).astype(np.int32))
+
+    gradcheck(
+        lambda l: cross_entropy(l, labels),
+        [logits], argnums=(0,), rtol=5e-2, atol=1e-2, sample=32,
+    )
+
+
 if __name__ == "__main__":
     test_matmul_gradcheck_2d()
     test_matmul_gradcheck_batched()
@@ -350,4 +400,7 @@ if __name__ == "__main__":
     test_geglu_gradcheck()
     test_squared_relu_gradcheck()
     test_squared_relu_vjp_vs_ref()
+    test_cross_entropy_value_vs_ref()
+    test_cross_entropy_grad_vs_ref()
+    test_cross_entropy_gradcheck_finite_diff()
     print("ALL PASS")

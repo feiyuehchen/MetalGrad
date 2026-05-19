@@ -21,6 +21,7 @@ from metalgrad.ops.layer_norm import layer_norm
 from metalgrad.ops.attention import attention
 from metalgrad.ops.activations import swiglu, geglu, squared_relu
 from metalgrad.ops.swiglu_ffn import swiglu_ffn, swiglu_ffn_unfused, stack_gate_up
+from metalgrad.ops.cross_entropy import cross_entropy
 
 __all__ = [
     "matmul", "rms_norm",
@@ -29,4 +30,5 @@ __all__ = [
     "attention",
     "swiglu", "geglu", "squared_relu",
     "swiglu_ffn", "swiglu_ffn_unfused", "stack_gate_up",
+    "cross_entropy",
 ]

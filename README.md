@@ -52,6 +52,7 @@ from metalgrad.ops import matmul, rms_norm
 | **`swiglu`** | **2.33×** | — | `mx.compile`-fused `silu(a) * b` |
 | **`geglu`** | **6.51×** | — | `mx.compile`-fused `gelu(a) * b` |
 | **`squared_relu`** | **1.76×** | — | `mx.compile`-fused `max(x, 0)²` |
+| **`cross_entropy`** | 0.65× | **1.76×** | one-pass online softmax fwd + fused grad bwd; **fwd+bwd combined 1.88×** |
 
 Benched on M3 Pro, FP32. Norm ops at `(4, 512, 1024)`; activations at
 `(4, 512, 2048)`. All ops pass `gradcheck` with `rel_err < 1e-5` vs the
