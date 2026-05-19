@@ -1,0 +1,32 @@
+[project]
+name = "metalgrad"
+version = "0.1.0"
+description = "Differentiable Metal kernels for Apple Silicon — train with custom kernels via mx.custom_vjp"
+authors = [
+    { name = "feiyuehchen", email = "feiyuehchen@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.31.0",
+    "numpy>=2.0",
+    "torch>=2.11.0",
+    "pyobjc-framework-metal>=12.1",
+    "pyobjc-framework-metalperformanceshaders>=12.1",
+    "pyobjc>=12.1",
+    "pandas>=2.0",
+    "tabulate>=0.9.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/metalgrad"]
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/metalgrad/ops" = "metalgrad/ops"
+"src/metalgrad/testing" = "metalgrad/testing"
