@@ -17,40 +17,45 @@ from metalgrad.differentiable import differentiable
 
 
 _LN_FWD_SRC = """
-    // Each TG = one SIMD (32 threads), one row.
-    // C must be divisible by 32. Each lane handles C/32 channels.
-    // Two simd_sum reductions: one for mean, one for variance.
+    // One SIMD per row, striped channel layout (see rms_norm.py for the
+    // coalescing rationale).
+    //
+    // Bandwidth: read x (8 MB) + write y (8 MB) = 16 MB.
+    // ~110 μs theoretical at (4, 512, 1024) on 150 GB/s.
     uint row = thread_position_in_grid.y;
     uint lane = thread_position_in_threadgroup.x;
     if (row >= N_ROWS) return;
 
-    int C_PER_LANE = (int)C / 32;
-    uint row_off = row * (uint)C + lane * (uint)C_PER_LANE;
+    constexpr int N_ITERS = (int)C / 32;
+    uint row_base = row * (uint)C;
     float eps = eps_arr[0];
 
-    // Pass 1: row sum -> mean.
+    // Load x once + accumulate lane sum.
+    float xs[N_ITERS];
     float lane_sum = 0.0f;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < C_PER_LANE; ++i) {
-        lane_sum += x[row_off + (uint)i];
+    for (int i = 0; i < N_ITERS; ++i) {
+        uint cidx = (uint)(i * 32) + lane;
+        float v = x[row_base + cidx];
+        xs[i] = v;
+        lane_sum += v;
     }
     float mean = simd_sum(lane_sum) / float(C);
 
-    // Pass 2: row sum of (x - mean)^2 -> variance.
+    // Sum of (x - mean)^2 from register.
     float lane_sq = 0.0f;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < C_PER_LANE; ++i) {
-        float d = x[row_off + (uint)i] - mean;
+    for (int i = 0; i < N_ITERS; ++i) {
+        float d = xs[i] - mean;
         lane_sq = fma(d, d, lane_sq);
     }
     float inv = rsqrt(simd_sum(lane_sq) / float(C) + eps);
 
-    // Pass 3: write y.
+    // Write y.
     #pragma clang loop unroll(full)
-    for (int i = 0; i < C_PER_LANE; ++i) {
-        uint cidx = lane * (uint)C_PER_LANE + (uint)i;
-        float v = x[row_off + (uint)i];
-        y[row_off + (uint)i] = (v - mean) * inv * weight[cidx] + bias[cidx];
+    for (int i = 0; i < N_ITERS; ++i) {
+        uint cidx = (uint)(i * 32) + lane;
+        y[row_base + cidx] = (xs[i] - mean) * inv * weight[cidx] + bias[cidx];
     }
 """
 
@@ -116,19 +121,51 @@ def _layer_norm_inner(x, weight, bias, eps):
     return _layer_norm_ref(x, weight, bias, float(eps))
 
 
+@mx.compile
+def _layer_norm_bwd_fused(x, weight, gy, eps_arr):
+    """Canonical LayerNorm backward, mx.compile-fused.
+
+    Forward y = n_hat * w + b   where   n_hat = (x - mean) * inv
+    Backward (Hinton 2016 / PyTorch reference):
+        dL/dx = (1/C) * inv * (C * gn - sum(gn) - n_hat * sum(gn * n_hat))
+        dL/dw = sum_batch( gy * n_hat )
+        dL/db = sum_batch( gy )
+    where  gn = gy * w.
+
+    All ops are elementwise reductions over the last axis — well-suited
+    to mx.compile fusion. Returns (gx, gw_contrib_per_elem,
+    gb_contrib_per_elem); caller sums the contribs over batch axes."""
+    eps = eps_arr[0]
+    C = x.shape[-1]
+    C_inv = 1.0 / float(C)
+    mean = mx.mean(x, axis=-1, keepdims=True)
+    var = mx.mean((x - mean) * (x - mean), axis=-1, keepdims=True)
+    inv = mx.rsqrt(var + eps)
+    n_hat = (x - mean) * inv
+
+    gn = gy * weight
+    sum_gn = mx.sum(gn, axis=-1, keepdims=True)
+    sum_gn_nhat = mx.sum(gn * n_hat, axis=-1, keepdims=True)
+    gx = C_inv * inv * (float(C) * gn - sum_gn - n_hat * sum_gn_nhat)
+
+    gw_contrib = gy * n_hat
+    gb_contrib = gy
+    return gx, gw_contrib, gb_contrib
+
+
 @_layer_norm_inner.vjp
 def _layer_norm_vjp(primals, cotangent, output):
     x, weight, bias, eps = primals
     gy = cotangent
-    e = float(eps)
-
-    # Use the pure-mx reference inside the VJP. mx.vjp cannot backprop
-    # through our custom Metal forward (CustomKernel has no built-in
-    # vjp); the math is identical so this is correct.
-    def _ref(xx, ww, bb):
-        return _layer_norm_mx(xx, ww, bb, e)
-
-    _, (gx, gw, gb) = mx.vjp(_ref, [x, weight, bias], [gy])
+    eps_arr = mx.array([float(eps)], dtype=x.dtype)
+    gx, gw_contrib, gb_contrib = _layer_norm_bwd_fused(x, weight, gy, eps_arr)
+    reduce_axes = tuple(range(x.ndim - 1))
+    if reduce_axes:
+        gw = mx.sum(gw_contrib, axis=reduce_axes)
+        gb = mx.sum(gb_contrib, axis=reduce_axes)
+    else:
+        gw = gw_contrib
+        gb = gb_contrib
     return gx, gw, gb, None
 
 

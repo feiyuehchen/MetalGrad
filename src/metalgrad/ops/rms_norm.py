@@ -32,38 +32,44 @@ from metalgrad.differentiable import differentiable
 
 
 _RMS_FWD_SRC = """
-    // Each TG = one SIMD (32 threads), one row (B*T position).
-    // Channels split across the 32 threads: each thread does C/32 channels.
-    // Pass 1: sum x*x across the row (each thread sums its C/32 elements,
-    //         then simd_sum reduces across the SIMD).
-    // Pass 2: each thread writes y = x * inv * weight for its C/32 channels.
+    // Each TG = one SIMD (32 threads), one row.
+    // C must be divisible by 32. Each thread handles C/32 channels.
     //
-    // `eps_arr` is a 1-element mx.array; mx.fast.metal_kernel only allows
-    // int / bool / Dtype as template args so we pass float eps via a tiny
-    // input buffer instead of templating it. That preserves bit-exact
-    // numerics when eps is small (e.g. 1e-5).
+    // STRIPED layout for coalesced reads: thread `lane` holds channels
+    // {lane, lane+32, lane+64, ...}. At iteration i in the unrolled
+    // loop, the 32 threads in the SIMD read x[row_base + i*32 + 0..31],
+    // which is one contiguous 128-byte cache line. Compare to the
+    // previous block-per-lane layout where threads 0..31 read
+    // 32-element-apart starts, costing 32 separate cache lines per
+    // iteration.
+    //
+    // Bandwidth: read x (8 MB) + write y (8 MB) = 16 MB.
+    // Theoretical ~110 μs at 150 GB/s for (4, 512, 1024).
     uint row = thread_position_in_grid.y;
     uint lane = thread_position_in_threadgroup.x;
     if (row >= N_ROWS) return;
 
-    int C_PER_LANE = (int)C / 32;
-    uint row_off = row * (uint)C + lane * (uint)C_PER_LANE;
+    constexpr int N_ITERS = (int)C / 32;
+    uint row_base = row * (uint)C;
     float eps = eps_arr[0];
 
+    // Load x into registers in striped order, accumulate sum_sq.
+    float xs[N_ITERS];
     float sq = 0.0f;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < C_PER_LANE; ++i) {
-        float v = x[row_off + (uint)i];
+    for (int i = 0; i < N_ITERS; ++i) {
+        uint cidx = (uint)(i * 32) + lane;
+        float v = x[row_base + cidx];
+        xs[i] = v;
         sq = fma(v, v, sq);
     }
-    float row_sq = simd_sum(sq);
-    float inv = rsqrt(row_sq / float(C) + eps);
+    float inv = rsqrt(simd_sum(sq) / float(C) + eps);
 
+    // Write y in the same striped order.
     #pragma clang loop unroll(full)
-    for (int i = 0; i < C_PER_LANE; ++i) {
-        uint cidx = lane * (uint)C_PER_LANE + (uint)i;
-        float v = x[row_off + (uint)i];
-        y[row_off + (uint)i] = v * inv * weight[cidx];
+    for (int i = 0; i < N_ITERS; ++i) {
+        uint cidx = (uint)(i * 32) + lane;
+        y[row_base + cidx] = xs[i] * inv * weight[cidx];
     }
 """
 
@@ -123,23 +129,30 @@ def _rms_norm_inner(x, weight, eps):
     return _rms_forward(x, weight, float(eps))
 
 
+@mx.compile
+def _rms_norm_bwd_fused(x, weight, gy, eps_arr):
+    """Closed-form backward, mx.compile-fused so the elementwise chain
+    runs as one kernel sequence. Returns (gx, gw_contributions_per_elem)
+    — the caller does the final batch-axis reduction for gw."""
+    eps = eps_arr[0]
+    C_inv = 1.0 / float(x.shape[-1])
+    s = mx.mean(x * x, axis=-1, keepdims=True) + eps
+    inv = mx.rsqrt(s)
+    gy_w = gy * weight
+    dot = mx.sum(gy_w * x, axis=-1, keepdims=True)
+    gx = inv * gy_w - (inv * inv * inv) * x * dot * C_inv
+    gw_contrib = gy * x * inv
+    return gx, gw_contrib
+
+
 @_rms_norm_inner.vjp
 def _rms_norm_vjp(primals, cotangent, output):
     x, weight, eps = primals
     gy = cotangent
-    C = x.shape[-1]
-    e = float(eps)
-    s = mx.mean(x * x, axis=-1, keepdims=True) + e
-    inv = mx.rsqrt(s)
-
-    contribs = gy * (x * inv)
+    eps_arr = mx.array([float(eps)], dtype=x.dtype)
+    gx, gw_contrib = _rms_norm_bwd_fused(x, weight, gy, eps_arr)
     reduce_axes = tuple(range(x.ndim - 1))
-    gw = mx.sum(contribs, axis=reduce_axes) if reduce_axes else contribs
-
-    gy_w = gy * weight
-    dot = mx.sum(gy_w * x, axis=-1, keepdims=True)
-    gx = inv * gy_w - (inv * inv * inv) * x * dot / float(C)
-
+    gw = mx.sum(gw_contrib, axis=reduce_axes) if reduce_axes else gw_contrib
     return gx, gw, None
 
 

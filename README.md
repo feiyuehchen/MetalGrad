@@ -42,19 +42,26 @@ training without losing autograd support.
 from metalgrad.ops import matmul, rms_norm
 ```
 
-| op | Forward speed vs `mx` | Notes |
-|---|---:|---|
-| `matmul` | 1.0× | `mx.matmul` is already MPSGraph-tuned |
-| **`rms_norm`** | **1.91×** ✓ | fused TG-cooperative SIMD reduction (v0.0.2) |
-| `conv1d` | 1.0× | `mx.conv1d` baseline |
-| `conv2d` | 1.0× | `mx.conv2d` baseline |
-| `depthwise_conv2d` | 1.0× | naive K=7 kernel lost to mx; disabled. Real kernel = v0.0.3. |
-| **`layer_norm`** | **2.80×** ✓ | fused two-pass reduction (v0.0.2) |
-| `attention` | 1.0× | `mx.fast.scaled_dot_product_attention` |
-| `swiglu` / `geglu` / `squared_relu` | 1.0× | new in v0.0.2, mx-backed forward |
+| op | Forward speedup | Backward speedup | Notes |
+|---|---:|---:|---|
+| `matmul` | 1.0× | 1.0× | thin re-export of `mx.matmul` (already MPSGraph-tuned) |
+| **`rms_norm`** | **2.56×** | **1.00×** | TG-cooperative SIMD reduction, register-tiled, mx.compile-fused backward |
+| **`layer_norm`** | **3.01×** | **1.15×** | same kernel pattern + canonical fused backward |
+| `conv1d` / `conv2d` / `depthwise_conv2d` | 1.0× | 1.0× | thin re-exports of `mx.conv*` — naive kernels lost to MPSGraph |
+| `attention` | 1.0× | 1.0× | thin re-export of `mx.fast.scaled_dot_product_attention` |
+| **`swiglu`** | **2.33×** | — | `mx.compile`-fused `silu(a) * b` |
+| **`geglu`** | **6.51×** | — | `mx.compile`-fused `gelu(a) * b` |
+| **`squared_relu`** | **1.76×** | — | `mx.compile`-fused `max(x, 0)²` |
 
-Benched on M3 Pro, FP32, batch shape `(4, 512, 1024)` for the norm ops.
-All ops pass `gradcheck` with `rel_err < 1e-5` vs the mx reference VJP.
+Benched on M3 Pro, FP32. Norm ops at `(4, 512, 1024)`; activations at
+`(4, 512, 2048)`. All ops pass `gradcheck` with `rel_err < 1e-5` vs the
+mx reference VJP.
+
+**Design principle:** an op only ships with `@differentiable` if we
+have a real forward speedup over `mx.{op}`. For ops where mx is
+already optimal (matmul, conv*, attention), `metalgrad.ops` is a
+direct re-export — wrapping costs ~2× on backward without any forward
+win.
 
 The v0.0.1 ops use mx-based forwards to establish the framework and
 pass gradcheck end-to-end. Custom Metal kernels land in v0.0.2 without
