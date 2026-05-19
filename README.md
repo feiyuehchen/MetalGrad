@@ -56,9 +56,11 @@ from metalgrad.ops import (
 | **`geglu`** | **6.51×** | — | `mx.compile`-fused `gelu(a) * b` (large because GELU itself fuses many subexprs) |
 | **`squared_relu`** | **1.76×** | — | `mx.compile`-fused `max(x, 0)²` |
 | **`cross_entropy`** | 0.65×‡ | **1.76×** | one-pass online softmax (Welford-style) forward + streaming fused-grad backward; **fwd + bwd combined 1.88×** |
+| **`kl_div_logits`** | **3.35×** | (combined fwd+bwd **3.39×**) | two parallel online-softmax passes (pred & target) in one kernel + streaming fused-grad backward writing `(softmax(pred) − softmax(target))/N` directly |
+| **`mse`** | parity | parity | `mx.compile`-fused `mean((p − t)²)` with closed-form `2(p − t)/N` VJP — useful as named API for regression / diffusion training |
 | `matmul`, `conv1d`, `conv2d`, `depthwise_conv2d` | 1.0× | 1.0× | thin re-exports — mx is already MPSGraph-tuned with `simdgroup_matrix` MMA |
 | `attention` | 1.0× | 1.0× | thin re-export — `mx.fast.scaled_dot_product_attention` is already FlashAttention-style (1.6–3.9× over manual SDPA) |
-| `rope` (via mx) | — | — | use `mx.fast.rope` directly — already fused (2.9× over manual) |
+| `rope_standard` / `rope_linear_pi` / `rope_ntk_aware` / `rope_yarn` / `rope_llama3` | 2.9× (via `mx.fast.rope`) | autograd via mx | thin wrappers around `mx.fast.rope`; each variant supplies a different frequency table to the same underlying fused rotation kernel |
 
 Benched on M3 Pro, FP32. Norm ops at `(4, 512, 1024)`; activations at
 `(4, 512, 2048)`; losses at `(N=1024, V=32000)`. Every op passes
