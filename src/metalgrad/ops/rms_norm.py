@@ -32,44 +32,44 @@ from metalgrad.differentiable import differentiable
 
 
 _RMS_FWD_SRC = """
-    // Each TG = one SIMD (32 threads), one row.
-    // C must be divisible by 32. Each thread handles C/32 channels.
+    // One SIMD per row. Striped float4 layout: thread `lane` holds the
+    // float4 group at channels (i*32 + lane) * 4 + (0..3) for each iter
+    // i in [0, N_ITERS_F4). For C=1024, N_ITERS_F4 = 1024/128 = 8.
     //
-    // STRIPED layout for coalesced reads: thread `lane` holds channels
-    // {lane, lane+32, lane+64, ...}. At iteration i in the unrolled
-    // loop, the 32 threads in the SIMD read x[row_base + i*32 + 0..31],
-    // which is one contiguous 128-byte cache line. Compare to the
-    // previous block-per-lane layout where threads 0..31 read
-    // 32-element-apart starts, costing 32 separate cache lines per
-    // iteration.
+    // Float4 cuts the per-thread load/store instruction count by 4× —
+    // each instruction moves 16 bytes instead of 4 — which frees up
+    // SIMD issue slots and reduces compiler scheduling pressure. The
+    // total bytes transferred stays the same.
     //
-    // Bandwidth: read x (8 MB) + write y (8 MB) = 16 MB.
-    // Theoretical ~110 μs at 150 GB/s for (4, 512, 1024).
+    // Requires C % 128 == 0. Host falls back to mx for other C.
     uint row = thread_position_in_grid.y;
     uint lane = thread_position_in_threadgroup.x;
     if (row >= N_ROWS) return;
 
-    constexpr int N_ITERS = (int)C / 32;
-    uint row_base = row * (uint)C;
+    constexpr int N_ITERS_F4 = (int)C / 128;
+    uint row_base_f4 = row * (uint)(C / 4);
     float eps = eps_arr[0];
 
-    // Load x into registers in striped order, accumulate sum_sq.
-    float xs[N_ITERS];
+    const device float4* x_v4 = (const device float4*)x;
+    const device float4* w_v4 = (const device float4*)weight;
+    device float4* y_v4 = (device float4*)y;
+
+    float4 xs[N_ITERS_F4];
     float sq = 0.0f;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_ITERS; ++i) {
-        uint cidx = (uint)(i * 32) + lane;
-        float v = x[row_base + cidx];
+    for (int i = 0; i < N_ITERS_F4; ++i) {
+        uint idx = (uint)(i * 32) + lane;
+        float4 v = x_v4[row_base_f4 + idx];
         xs[i] = v;
-        sq = fma(v, v, sq);
+        sq += dot(v, v);   // x²+y²+z²+w² → one SIMD-level op
     }
     float inv = rsqrt(simd_sum(sq) / float(C) + eps);
 
-    // Write y in the same striped order.
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_ITERS; ++i) {
-        uint cidx = (uint)(i * 32) + lane;
-        y[row_base + cidx] = xs[i] * inv * weight[cidx];
+    for (int i = 0; i < N_ITERS_F4; ++i) {
+        uint idx = (uint)(i * 32) + lane;
+        float4 wv = w_v4[idx];
+        y_v4[row_base_f4 + idx] = xs[i] * inv * wv;
     }
 """
 
@@ -96,7 +96,7 @@ def _rms_forward(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     the channel axis). For other C we fall back to the mx implementation.
     """
     C = x.shape[-1]
-    if C % 32 != 0 or x.ndim < 2:
+    if C % 128 != 0 or x.ndim < 2:
         return _rms_forward_mx(x, weight, eps)
 
     orig_shape = x.shape

@@ -17,45 +17,45 @@ from metalgrad.differentiable import differentiable
 
 
 _LN_FWD_SRC = """
-    // One SIMD per row, striped channel layout (see rms_norm.py for the
-    // coalescing rationale).
-    //
-    // Bandwidth: read x (8 MB) + write y (8 MB) = 16 MB.
-    // ~110 μs theoretical at (4, 512, 1024) on 150 GB/s.
+    // Same float4 striped layout as rms_norm. C must be divisible by 128.
     uint row = thread_position_in_grid.y;
     uint lane = thread_position_in_threadgroup.x;
     if (row >= N_ROWS) return;
 
-    constexpr int N_ITERS = (int)C / 32;
-    uint row_base = row * (uint)C;
+    constexpr int N_ITERS_F4 = (int)C / 128;
+    uint row_base_f4 = row * (uint)(C / 4);
     float eps = eps_arr[0];
 
-    // Load x once + accumulate lane sum.
-    float xs[N_ITERS];
+    const device float4* x_v4 = (const device float4*)x;
+    const device float4* w_v4 = (const device float4*)weight;
+    const device float4* b_v4 = (const device float4*)bias;
+    device float4* y_v4 = (device float4*)y;
+
+    float4 xs[N_ITERS_F4];
     float lane_sum = 0.0f;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_ITERS; ++i) {
-        uint cidx = (uint)(i * 32) + lane;
-        float v = x[row_base + cidx];
+    for (int i = 0; i < N_ITERS_F4; ++i) {
+        uint idx = (uint)(i * 32) + lane;
+        float4 v = x_v4[row_base_f4 + idx];
         xs[i] = v;
-        lane_sum += v;
+        lane_sum += v.x + v.y + v.z + v.w;
     }
     float mean = simd_sum(lane_sum) / float(C);
 
-    // Sum of (x - mean)^2 from register.
     float lane_sq = 0.0f;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_ITERS; ++i) {
-        float d = xs[i] - mean;
-        lane_sq = fma(d, d, lane_sq);
+    for (int i = 0; i < N_ITERS_F4; ++i) {
+        float4 d = xs[i] - mean;
+        lane_sq += dot(d, d);
     }
     float inv = rsqrt(simd_sum(lane_sq) / float(C) + eps);
 
-    // Write y.
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_ITERS; ++i) {
-        uint cidx = (uint)(i * 32) + lane;
-        y[row_base + cidx] = (xs[i] - mean) * inv * weight[cidx] + bias[cidx];
+    for (int i = 0; i < N_ITERS_F4; ++i) {
+        uint idx = (uint)(i * 32) + lane;
+        float4 wv = w_v4[idx];
+        float4 bv = b_v4[idx];
+        y_v4[row_base_f4 + idx] = (xs[i] - mean) * inv * wv + bv;
     }
 """
 
@@ -111,7 +111,7 @@ def _layer_norm_ref(x: mx.array, weight: mx.array, bias: mx.array,
                     eps: float) -> mx.array:
     """Forward dispatch: fast Metal kernel where supported, else mx."""
     C = x.shape[-1]
-    if C % 32 == 0 and x.ndim >= 2:
+    if C % 128 == 0 and x.ndim >= 2:
         return _layer_norm_fast(x, weight, bias, float(eps))
     return _layer_norm_mx(x, weight, bias, eps)
 
