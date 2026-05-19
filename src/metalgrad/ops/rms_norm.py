@@ -46,31 +46,32 @@ def _rms_forward(x: mx.array, weight: mx.array, eps: float) -> mx.array:
 
 
 @differentiable
-def rms_norm(x: mx.array, weight: mx.array, eps: float = 1e-6) -> mx.array:
-    return _rms_forward(x, weight, eps)
+def _rms_norm_inner(x, weight, eps):
+    return _rms_forward(x, weight, float(eps))
 
 
-@rms_norm.vjp
+@_rms_norm_inner.vjp
 def _rms_norm_vjp(primals, cotangent, output):
     x, weight, eps = primals
     gy = cotangent
     C = x.shape[-1]
-    s = mx.mean(x * x, axis=-1, keepdims=True) + eps   # (..., 1)
-    inv = mx.rsqrt(s)                                  # (..., 1)
+    e = float(eps)
+    s = mx.mean(x * x, axis=-1, keepdims=True) + e
+    inv = mx.rsqrt(s)
 
-    # gw = sum_over_batch(gy * (x * inv))
     contribs = gy * (x * inv)
     reduce_axes = tuple(range(x.ndim - 1))
     gw = mx.sum(contribs, axis=reduce_axes) if reduce_axes else contribs
 
-    # gx = inv * (gy * weight) - (1/C) * inv^3 * x * sum_along_last( gy * weight * x )
     gy_w = gy * weight
-    dot = mx.sum(gy_w * x, axis=-1, keepdims=True)     # (..., 1)
+    dot = mx.sum(gy_w * x, axis=-1, keepdims=True)
     gx = inv * gy_w - (inv * inv * inv) * x * dot / float(C)
 
-    # eps is a Python float, not an mx.array — no gradient computed.
-    # custom_function expects one gradient per positional arg; emit None.
     return gx, gw, None
+
+
+def rms_norm(x: mx.array, weight: mx.array, eps: float = 1e-6) -> mx.array:
+    return _rms_norm_inner(x, weight, eps)
 
 
 __all__ = ["rms_norm"]

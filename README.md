@@ -46,10 +46,10 @@ from metalgrad.ops import matmul, rms_norm
 |---|---|---|---|
 | `matmul` | `mx.matmul` | custom `simdgroup_matrix` GEMM | ✓ explicit |
 | `rms_norm` | mx ops | fused TG-cooperative reduction kernel | ✓ explicit |
-| `conv1d` | _planned_ | _planned_ | _planned_ |
-| `conv2d` | _planned_ | _planned_ | _planned_ |
-| `depthwise_conv2d` | _planned_ | _planned_ | _planned_ |
-| `layer_norm` | _planned_ | _planned_ | _planned_ |
+| `conv1d` | `mx.conv1d` | custom Metal float4+fma kernel | ✓ via `mx.vjp` |
+| `conv2d` | `mx.conv2d` | custom Metal kernel | ✓ via `mx.vjp` |
+| `depthwise_conv2d` | `mx.conv2d` (groups=C) | ConvNeXt K=7 dedicated kernel | ✓ via `mx.vjp` |
+| `layer_norm` | mx ops | fused Metal kernel | ✓ via `mx.vjp` |
 
 The v0.0.1 ops use mx-based forwards to establish the framework and
 pass gradcheck end-to-end. Custom Metal kernels land in v0.0.2 without
