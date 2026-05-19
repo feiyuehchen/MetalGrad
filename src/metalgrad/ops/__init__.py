@@ -20,6 +20,7 @@ from metalgrad.ops.depthwise_conv2d import depthwise_conv2d
 from metalgrad.ops.layer_norm import layer_norm
 from metalgrad.ops.attention import attention
 from metalgrad.ops.activations import swiglu, geglu, squared_relu
+from metalgrad.ops.swiglu_ffn import swiglu_ffn, swiglu_ffn_unfused, stack_gate_up
 
 __all__ = [
     "matmul", "rms_norm",
@@ -27,4 +28,5 @@ __all__ = [
     "layer_norm",
     "attention",
     "swiglu", "geglu", "squared_relu",
+    "swiglu_ffn", "swiglu_ffn_unfused", "stack_gate_up",
 ]

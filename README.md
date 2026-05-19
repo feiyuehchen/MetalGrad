@@ -63,6 +63,37 @@ already optimal (matmul, conv*, attention), `metalgrad.ops` is a
 direct re-export — wrapping costs ~2× on backward without any forward
 win.
 
+## Scaling
+
+Speedups grow with workload size. `scripts/bench_scaling.py`:
+
+| shape | data | rms_norm | layer_norm |
+|---|---:|---:|---:|
+| (4, 512, 1024) | 8 MB | 2.59× | 3.75× |
+| (8, 512, 2048) | 34 MB | 2.76× | 5.82× |
+| (4, 2048, 2048) | 67 MB | 3.08× | 6.33× |
+| (8, 1024, 4096) | 134 MB | **3.76×** | **6.81×** |
+
+At the largest shape, our kernels reach **60–67% of theoretical
+memory bandwidth peak** (150 GB/s). mx is at 18–27% peak — its
+multi-pass implementation (`mean` → intermediate → `var` →
+intermediate → normalize → multiply) wastes most of the budget on
+loads of intermediate tensors.
+
+## Higher-level convenience APIs
+
+- `swiglu_ffn(x, W_gate_up, W_down)` — Llama-style SwiGLU FFN with
+  the standard fused gate+up matmul (W_gate and W_up stacked along
+  output axis). Use `stack_gate_up(W_gate, W_up)` once at model init.
+  **Note:** the fusion saves one matmul dispatch but speed is
+  effectively neutral at training-scale shapes (the matmul compute
+  dominates). The op exists as a named API, not as a speedup.
+
+- `attention` — re-export of `mx.fast.scaled_dot_product_attention`,
+  which is itself a FlashAttention-style fused kernel. Measured
+  1.58–3.94× faster than manual SDPA. Reimplementing it from scratch
+  has no upside.
+
 The v0.0.1 ops use mx-based forwards to establish the framework and
 pass gradcheck end-to-end. Custom Metal kernels land in v0.0.2 without
 changing the VJP — that is the point of the wrapper.
