@@ -55,6 +55,10 @@ from metalgrad.ops import (
     rope_standard, rope_linear_pi, rope_ntk_aware, rope_yarn, rope_llama3,
     # training-side fused kernels (not part of the autograd graph)
     adamw_step, ema_update, clip_grad_norm,
+    # HuBERT / data2vec / sylber speech stack
+    group_norm,
+    l1_loss, smooth_l1_loss, cosine_loss, l2_normalize,
+    sinusoidal_pe,
 )
 ```
 
@@ -72,6 +76,12 @@ from metalgrad.ops import (
 | **`adamw_step`** | **3.80×** (per-tensor) | — (no VJP; optimizer kernel) | fused AdamW: `(param, grad, m, v) → (new_param, new_m, new_v)` in one pass. Every training step uses this |
 | `ema_update` | parity | — | `α · ema + (1 − α) · param`. `mx.compile` already fuses; shipped as named API |
 | `clip_grad_norm` | (small bench win) | — | global L2 norm over a list of grad tensors + scale. One pass per grad tensor |
+| **`group_norm`** | **1.3-4.0×** | (via `mx.vjp`) | TG-cooperative reduction over `C/num_groups` channels per (B, T) row. Used by HuBERT / WavLM / data2vec feature extractors. Requires `C/num_groups` divisible by 32 (fallback to mx otherwise) |
+| `l1_loss` | parity | ✓ closed-form sign-based VJP | `mean(|p − t|)` |
+| `smooth_l1_loss` | parity | autograd via mx | Huber: quadratic when `|d| < β`, linear outside. `β = 0` reduces to `0.5·MSE` (data2vec default) |
+| `cosine_loss` | parity | autograd via mx | `1 − mean(cos_sim(a, b))` over the last axis. Distillation / contrastive |
+| `l2_normalize` | parity | autograd via mx | unit L2 norm along last axis. Pre-step for cosine ops |
+| `sinusoidal_pe(T, D)` | n/a | — | classical absolute positional encoding builder. No gradient (constant function of `T`, `D`). Fills the `mx.fast.rope` gap for absolute PE |
 | `matmul`, `conv1d`, `conv2d`, `depthwise_conv2d` | 1.0× | 1.0× | thin re-exports — mx is already MPSGraph-tuned with `simdgroup_matrix` MMA |
 | `attention` | 1.0× | 1.0× | thin re-export — `mx.fast.scaled_dot_product_attention` is already FlashAttention-style (1.6–3.9× over manual SDPA) |
 | `rope_standard` / `rope_linear_pi` / `rope_ntk_aware` / `rope_yarn` / `rope_llama3` | 2.9× (via `mx.fast.rope`) | autograd via mx | thin wrappers around `mx.fast.rope`; each variant supplies a different frequency table to the same underlying fused rotation kernel |

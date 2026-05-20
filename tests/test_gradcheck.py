@@ -19,6 +19,7 @@ from metalgrad.ops import (
     swiglu, geglu, squared_relu, cross_entropy, mse, kl_div_logits,
     rope_standard, rope_llama3, rope_yarn,
     adaln,
+    group_norm, l1_loss, smooth_l1_loss, cosine_loss, l2_normalize, sinusoidal_pe,
 )
 from metalgrad.testing import gradcheck
 
@@ -495,6 +496,86 @@ def test_rope_variants_finite():
         assert bool(mx.all(mx.isfinite(y))), "non-finite RoPE output"
 
 
+def test_group_norm_value_vs_ref():
+    B, T, C, G = 2, 16, 128, 4   # CPG = 32, fast kernel
+    rng = np.random.default_rng(80)
+    x = mx.array((rng.standard_normal((B, T, C)) * 0.3).astype(np.float32))
+    w = mx.array((1.0 + 0.1*rng.standard_normal(C)).astype(np.float32))
+    b = mx.array(0.05*rng.standard_normal(C).astype(np.float32))
+    def ref(x, w, b):
+        xr = x.reshape(B, T, G, C//G)
+        m = mx.mean(xr, axis=-1, keepdims=True)
+        v = mx.mean((xr-m)**2, axis=-1, keepdims=True)
+        return ((xr-m) * mx.rsqrt(v+1e-5)).reshape(B, T, C) * w + b
+    y_o = group_norm(x, w, b, G)
+    y_r = ref(x, w, b)
+    mx.eval(y_o, y_r)
+    rel = float(mx.abs(y_o - y_r).max()) / max(float(mx.abs(y_r).max()), 1e-9)
+    assert rel < 1e-5, f"group_norm value rel err {rel:.2e}"
+
+
+def test_group_norm_grad_vs_ref():
+    B, T, C, G = 1, 8, 128, 4
+    rng = np.random.default_rng(81)
+    x = mx.array((rng.standard_normal((B, T, C)) * 0.3).astype(np.float32))
+    w = mx.array((1.0 + 0.1*rng.standard_normal(C)).astype(np.float32))
+    b = mx.array(0.05*rng.standard_normal(C).astype(np.float32))
+    def ref(x, w, b):
+        xr = x.reshape(B, T, G, C//G)
+        m = mx.mean(xr, axis=-1, keepdims=True)
+        v = mx.mean((xr-m)**2, axis=-1, keepdims=True)
+        return ((xr-m) * mx.rsqrt(v+1e-5)).reshape(B, T, C) * w + b
+    def L_o(x, w, b): return mx.sum(group_norm(x, w, b, G) ** 2)
+    def L_r(x, w, b): return mx.sum(ref(x, w, b) ** 2)
+    g_o = mx.grad(L_o, argnums=(0,1,2))(x, w, b)
+    g_r = mx.grad(L_r, argnums=(0,1,2))(x, w, b)
+    mx.eval(*g_o, *g_r)
+    for i, n in enumerate("xwb"):
+        rel = float(mx.abs(g_o[i] - g_r[i]).max()) / max(float(mx.abs(g_r[i]).max()), 1e-9)
+        assert rel < 1e-5, f"group_norm g{n} rel err {rel:.2e}"
+
+
+def test_l1_loss_grad_vs_ref():
+    p = _arr(4, 32, seed=82); t = _arr(4, 32, seed=83)
+    def ref(p): return mx.mean(mx.abs(p - t))
+    g_o = mx.grad(lambda p: l1_loss(p, t))(p)
+    g_r = mx.grad(ref)(p)
+    mx.eval(g_o, g_r)
+    rel = float(mx.abs(g_o - g_r).max()) / max(float(mx.abs(g_r).max()), 1e-9)
+    assert rel < 1e-5, f"l1_loss grad rel err {rel:.2e}"
+
+
+def test_smooth_l1_grad_runs():
+    p = _arr(4, 32, seed=84); t = _arr(4, 32, seed=85)
+    g = mx.grad(lambda p: smooth_l1_loss(p, t, beta=1.0))(p)
+    mx.eval(g)
+    assert g.shape == p.shape and bool(mx.all(mx.isfinite(g)))
+
+
+def test_cosine_loss_grad_runs():
+    a = _arr(8, 32, seed=86); b = _arr(8, 32, seed=87)
+    g = mx.grad(lambda a: cosine_loss(a, b))(a)
+    mx.eval(g)
+    assert g.shape == a.shape and bool(mx.all(mx.isfinite(g)))
+
+
+def test_l2_normalize_unit_norm():
+    x = _arr(4, 32, seed=88)
+    y = l2_normalize(x)
+    norms = mx.sqrt(mx.sum(y * y, axis=-1))
+    mx.eval(norms)
+    assert all(abs(float(n) - 1.0) < 1e-5 for n in norms.flatten().tolist())
+
+
+def test_sinusoidal_pe_shape_and_values():
+    pe = sinusoidal_pe(64, 32)
+    mx.eval(pe)
+    assert pe.shape == (64, 32)
+    # Position 0: sin(0)=0, cos(0)=1, alternating
+    assert abs(float(pe[0, 0]) - 0.0) < 1e-6
+    assert abs(float(pe[0, 1]) - 1.0) < 1e-6
+
+
 if __name__ == "__main__":
     test_matmul_gradcheck_2d()
     test_matmul_gradcheck_batched()
@@ -527,4 +608,11 @@ if __name__ == "__main__":
     test_rope_variants_finite()
     test_adaln_value_vs_ref()
     test_adaln_grad_vs_ref()
+    test_group_norm_value_vs_ref()
+    test_group_norm_grad_vs_ref()
+    test_l1_loss_grad_vs_ref()
+    test_smooth_l1_grad_runs()
+    test_cosine_loss_grad_runs()
+    test_l2_normalize_unit_norm()
+    test_sinusoidal_pe_shape_and_values()
     print("ALL PASS")

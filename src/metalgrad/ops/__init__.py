@@ -31,6 +31,11 @@ from metalgrad.ops.rope import (
 )
 from metalgrad.ops.adaln import adaln
 from metalgrad.ops.optim import adamw_step, ema_update, clip_grad_norm
+from metalgrad.ops.group_norm import group_norm
+from metalgrad.ops.losses_extra import (
+    l1_loss, smooth_l1_loss, cosine_loss, l2_normalize,
+)
+from metalgrad.ops.position import sinusoidal_pe
 
 __all__ = [
     "matmul", "rms_norm",
@@ -46,4 +51,7 @@ __all__ = [
     "rope_yarn", "rope_llama3",
     "adaln",
     "adamw_step", "ema_update", "clip_grad_norm",
+    "group_norm",
+    "l1_loss", "smooth_l1_loss", "cosine_loss", "l2_normalize",
+    "sinusoidal_pe",
 ]
