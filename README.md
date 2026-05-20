@@ -40,11 +40,21 @@ without losing autograd.
 
 ```python
 from metalgrad.ops import (
+    # core layers (norms + linear + conv + attention)
     matmul, conv1d, conv2d, depthwise_conv2d,
     rms_norm, layer_norm, attention,
+    # DiT / FCDM modulation
+    adaln,
+    # activations
     swiglu, geglu, squared_relu,
-    cross_entropy,
+    # losses
+    cross_entropy, mse, kl_div_logits,
+    # FFN blocks (convenience APIs)
     swiglu_ffn, stack_gate_up,
+    # RoPE variants (freqs builders + thin wrappers around mx.fast.rope)
+    rope_standard, rope_linear_pi, rope_ntk_aware, rope_yarn, rope_llama3,
+    # training-side fused kernels (not part of the autograd graph)
+    adamw_step, ema_update, clip_grad_norm,
 )
 ```
 
