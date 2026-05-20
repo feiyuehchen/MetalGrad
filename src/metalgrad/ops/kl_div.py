@@ -63,7 +63,7 @@ _KL_FWD_SRC = """
     float mp = -INFINITY;
     float sp = 0.0f;
     for (uint i = lane; i < (uint)V; i += 32u) {
-        float x = pred_logits[row_off + i];
+        float x = float(pred_logits[row_off + i]);
         float mn = max(mp, x);
         sp = sp * exp(mp - mn) + exp(x - mn);
         mp = mn;
@@ -82,7 +82,7 @@ _KL_FWD_SRC = """
     float mt = -INFINITY;
     float st = 0.0f;
     for (uint i = lane; i < (uint)V; i += 32u) {
-        float x = target_logits[row_off + i];
+        float x = float(target_logits[row_off + i]);
         float mn = max(mt, x);
         st = st * exp(mt - mn) + exp(x - mn);
         mt = mn;
@@ -102,41 +102,39 @@ _KL_FWD_SRC = """
     // The +(log_Z_p - log_Z_t) factor is constant across j; we add it once.
     float lane_kl = 0.0f;
     for (uint i = lane; i < (uint)V; i += 32u) {
-        float lt = target_logits[row_off + i];
-        float lp = pred_logits[row_off + i];
+        float lt = float(target_logits[row_off + i]);
+        float lp = float(pred_logits[row_off + i]);
         float p_t = exp(lt - log_Z_t);             // softmax(target)[j]
         lane_kl += p_t * (lt - lp);
     }
     float row_kl_partial = simd_sum(lane_kl);
     if (lane == 0) {
-        // softmax(target) sums to 1 by construction, so multiplying
-        // (log_Z_p - log_Z_t) by sum(softmax(target)) is just adding
-        // (log_Z_p - log_Z_t) once per row.
-        kl_per_row[row] = row_kl_partial + (log_Z_p - log_Z_t);
+        kl_per_row[row] = T(row_kl_partial + (log_Z_p - log_Z_t));
     }
 """
 
-_kl_fwd_kernel = None
+_kl_fwd_kernels: dict = {}
 
 
-def _get_kl_fwd_kernel():
-    global _kl_fwd_kernel
-    if _kl_fwd_kernel is None:
-        _kl_fwd_kernel = mx.fast.metal_kernel(
-            name="metalgrad_kl_div_logits_fwd",
+def _get_kl_fwd_kernel(dtype):
+    k = _kl_fwd_kernels.get(dtype)
+    if k is None:
+        k = mx.fast.metal_kernel(
+            name=f"metalgrad_kl_div_logits_fwd_{str(dtype).split('.')[-1]}",
             input_names=["pred_logits", "target_logits"],
             output_names=["kl_per_row"],
             source=_KL_FWD_SRC,
         )
-    return _kl_fwd_kernel
+        _kl_fwd_kernels[dtype] = k
+    return k
 
 
 def _kl_div_per_row_fast(pred_logits, target_logits):
     N, V = pred_logits.shape
-    kernel = _get_kl_fwd_kernel()
+    kernel = _get_kl_fwd_kernel(pred_logits.dtype)
     (kl,) = kernel(
         inputs=[pred_logits, target_logits],
-        template=[("V", V), ("N_ROWS", N)],
+        template=[("V", V), ("N_ROWS", N), ("T", pred_logits.dtype)],
         grid=(32, N, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(N,)],
@@ -163,8 +161,8 @@ _KL_BWD_SRC = """
     float mp = -INFINITY; float sp = 0.0f;
     float mt = -INFINITY; float st = 0.0f;
     for (uint i = lane; i < (uint)V; i += 32u) {
-        float xp = pred_logits[row_off + i];
-        float xt = target_logits[row_off + i];
+        float xp = float(pred_logits[row_off + i]);
+        float xt = float(target_logits[row_off + i]);
         float mn_p = max(mp, xp);  sp = sp * exp(mp - mn_p) + exp(xp - mn_p); mp = mn_p;
         float mn_t = max(mt, xt);  st = st * exp(mt - mn_t) + exp(xt - mn_t); mt = mn_t;
     }
@@ -182,36 +180,37 @@ _KL_BWD_SRC = """
 
     // Write grad = (softmax(pred) - softmax(target)) / N * upstream.
     for (uint i = lane; i < (uint)V; i += 32u) {
-        float xp = pred_logits[row_off + i];
-        float xt = target_logits[row_off + i];
+        float xp = float(pred_logits[row_off + i]);
+        float xt = float(target_logits[row_off + i]);
         float sm_p = exp(xp - mp) * inv_sp;
         float sm_t = exp(xt - mt) * inv_st;
-        grad[row_off + i] = (sm_p - sm_t) * inv_N * upstream;
+        grad[row_off + i] = T((sm_p - sm_t) * inv_N * upstream);
     }
 """
 
-_kl_bwd_kernel = None
+_kl_bwd_kernels: dict = {}
 
 
-def _get_kl_bwd_kernel():
-    global _kl_bwd_kernel
-    if _kl_bwd_kernel is None:
-        _kl_bwd_kernel = mx.fast.metal_kernel(
-            name="metalgrad_kl_div_logits_bwd",
+def _get_kl_bwd_kernel(dtype):
+    k = _kl_bwd_kernels.get(dtype)
+    if k is None:
+        k = mx.fast.metal_kernel(
+            name=f"metalgrad_kl_div_logits_bwd_{str(dtype).split('.')[-1]}",
             input_names=["pred_logits", "target_logits", "gy_arr"],
             output_names=["grad"],
             source=_KL_BWD_SRC,
         )
-    return _kl_bwd_kernel
+        _kl_bwd_kernels[dtype] = k
+    return k
 
 
 def _kl_div_grad_fast(pred_logits, target_logits, gy):
     N, V = pred_logits.shape
-    kernel = _get_kl_bwd_kernel()
+    kernel = _get_kl_bwd_kernel(pred_logits.dtype)
     gy_arr = gy.reshape((1,)) if gy.ndim == 0 else gy
     (grad,) = kernel(
         inputs=[pred_logits, target_logits, gy_arr],
-        template=[("V", V), ("N_ROWS", N)],
+        template=[("V", V), ("N_ROWS", N), ("T", pred_logits.dtype)],
         grid=(32, N, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(N, V)],

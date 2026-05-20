@@ -32,71 +32,65 @@ from metalgrad.differentiable import differentiable
 
 
 _RMS_FWD_SRC = """
-    // One SIMD per row. Striped float4 layout: thread `lane` holds the
-    // float4 group at channels (i*32 + lane) * 4 + (0..3) for each iter
-    // i in [0, N_ITERS_F4). For C=1024, N_ITERS_F4 = 1024/128 = 8.
+    // One SIMD per row, striped scalar layout. C % 32 == 0 required.
     //
-    // Float4 cuts the per-thread load/store instruction count by 4× —
-    // each instruction moves 16 bytes instead of 4 — which frees up
-    // SIMD issue slots and reduces compiler scheduling pressure. The
-    // total bytes transferred stays the same.
-    //
-    // Requires C % 128 == 0. Host falls back to mx for other C.
+    // Accumulation is always in float internally, regardless of the
+    // input dtype: reads from x are auto-promoted (half → float,
+    // bfloat → float on M3+); writes to y are explicitly cast to T
+    // (= x.dtype) so we work correctly on FP16 / BF16 / FP32.
     uint row = thread_position_in_grid.y;
     uint lane = thread_position_in_threadgroup.x;
     if (row >= N_ROWS) return;
 
-    constexpr int N_ITERS_F4 = (int)C / 128;
-    uint row_base_f4 = row * (uint)(C / 4);
-    float eps = eps_arr[0];
+    constexpr int N_ITERS = (int)C / 32;
+    uint row_base = row * (uint)C;
+    float eps = float(eps_arr[0]);
 
-    const device float4* x_v4 = (const device float4*)x;
-    const device float4* w_v4 = (const device float4*)weight;
-    device float4* y_v4 = (device float4*)y;
-
-    float4 xs[N_ITERS_F4];
+    float xs[N_ITERS];
     float sq = 0.0f;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_ITERS_F4; ++i) {
-        uint idx = (uint)(i * 32) + lane;
-        float4 v = x_v4[row_base_f4 + idx];
+    for (int i = 0; i < N_ITERS; ++i) {
+        uint cidx = (uint)(i * 32) + lane;
+        float v = float(x[row_base + cidx]);
         xs[i] = v;
-        sq += dot(v, v);   // x²+y²+z²+w² → one SIMD-level op
+        sq = fma(v, v, sq);
     }
     float inv = rsqrt(simd_sum(sq) / float(C) + eps);
 
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_ITERS_F4; ++i) {
-        uint idx = (uint)(i * 32) + lane;
-        float4 wv = w_v4[idx];
-        y_v4[row_base_f4 + idx] = xs[i] * inv * wv;
+    for (int i = 0; i < N_ITERS; ++i) {
+        uint cidx = (uint)(i * 32) + lane;
+        float result = xs[i] * inv * float(weight[cidx]);
+        y[row_base + cidx] = T(result);
     }
 """
 
 _rms_kernels: dict = {}
 
 
-def _get_rms_kernel(C: int):
-    k = _rms_kernels.get(C)
+def _get_rms_kernel(C: int, dtype):
+    key = (C, dtype)
+    k = _rms_kernels.get(key)
     if k is None:
         k = mx.fast.metal_kernel(
-            name=f"metalgrad_rms_norm_fwd_C{C}",
+            name=f"metalgrad_rms_norm_fwd_C{C}_{str(dtype).split('.')[-1]}",
             input_names=["x", "weight", "eps_arr"],
             output_names=["y"],
             source=_RMS_FWD_SRC,
         )
-        _rms_kernels[C] = k
+        _rms_kernels[key] = k
     return k
 
 
 def _rms_forward(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     """Fused Metal kernel forward: one TG per row, simd_sum reduction.
 
-    Requires C divisible by 32 (one SIMD group per row, 32 lanes split
-    the channel axis). For other C we fall back to the mx implementation.
+    Requires C % 32 == 0. The kernel works in float internally and
+    casts to / from x.dtype at the boundaries (`T` template), so FP32 /
+    FP16 / BF16 all produce correct results.
     """
     C = x.shape[-1]
-    if C % 128 != 0 or x.ndim < 2:
+    if C % 32 != 0 or x.ndim < 2:
         return _rms_forward_mx(x, weight, eps)
 
     orig_shape = x.shape
@@ -106,10 +100,10 @@ def _rms_forward(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     x_flat = x.reshape(n_rows, C)
     eps_arr = mx.array([float(eps)], dtype=x.dtype)
 
-    kernel = _get_rms_kernel(C)
+    kernel = _get_rms_kernel(C, x.dtype)
     (y_flat,) = kernel(
         inputs=[x_flat, weight, eps_arr],
-        template=[("C", C), ("N_ROWS", n_rows)],
+        template=[("C", C), ("N_ROWS", n_rows), ("T", x.dtype)],
         grid=(32, n_rows, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(n_rows, C)],

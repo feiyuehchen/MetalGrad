@@ -50,11 +50,12 @@ _CE_FWD_SRC = """
 
     uint row_off = row * (uint)V;
 
-    // Stream with online softmax stats.
+    // Stream with online softmax stats. Internal computation in float
+    // regardless of logits' dtype (FP16/BF16 inputs auto-promote).
     float m = -INFINITY;
     float s = 0.0f;
     for (uint i = lane; i < (uint)V; i += 32u) {
-        float x = logits[row_off + i];
+        float x = float(logits[row_off + i]);
         float m_new = max(m, x);
         s = s * exp(m - m_new) + exp(x - m_new);
         m = m_new;
@@ -73,33 +74,34 @@ _CE_FWD_SRC = """
     if (lane == 0) {
         float lse = log(s) + m;
         int label_idx = labels[row];
-        float label_logit = logits[row_off + (uint)label_idx];
-        loss_per_row[row] = lse - label_logit;
+        float label_logit = float(logits[row_off + (uint)label_idx]);
+        loss_per_row[row] = T(lse - label_logit);
     }
 """
 
-_ce_kernel = None
+_ce_kernels: dict = {}
 
 
-def _get_ce_kernel():
-    global _ce_kernel
-    if _ce_kernel is None:
-        _ce_kernel = mx.fast.metal_kernel(
-            name="metalgrad_cross_entropy_fwd",
+def _get_ce_kernel(dtype):
+    k = _ce_kernels.get(dtype)
+    if k is None:
+        k = mx.fast.metal_kernel(
+            name=f"metalgrad_cross_entropy_fwd_{str(dtype).split('.')[-1]}",
             input_names=["logits", "labels"],
             output_names=["loss_per_row"],
             source=_CE_FWD_SRC,
         )
-    return _ce_kernel
+        _ce_kernels[dtype] = k
+    return k
 
 
 def _cross_entropy_per_row_fast(logits: mx.array, labels: mx.array) -> mx.array:
     """Returns (N,) per-row losses. Mean reduction happens at the caller."""
     N, V = logits.shape
-    kernel = _get_ce_kernel()
+    kernel = _get_ce_kernel(logits.dtype)
     (loss_per_row,) = kernel(
         inputs=[logits, labels],
-        template=[("V", V), ("N_ROWS", N)],
+        template=[("V", V), ("N_ROWS", N), ("T", logits.dtype)],
         grid=(32, N, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(N,)],
@@ -136,7 +138,7 @@ _CE_BWD_SRC = """
     // Pass 1: max.
     float lane_max = -INFINITY;
     for (uint i = lane; i < (uint)V; i += 32u) {
-        float v = logits[row_off + i];
+        float v = float(logits[row_off + i]);
         lane_max = max(lane_max, v);
     }
     float row_max = simd_max(lane_max);
@@ -144,45 +146,45 @@ _CE_BWD_SRC = """
     // Pass 2: sum_exp.
     float lane_sum = 0.0f;
     for (uint i = lane; i < (uint)V; i += 32u) {
-        float v = logits[row_off + i];
+        float v = float(logits[row_off + i]);
         lane_sum += exp(v - row_max);
     }
     float row_sum_exp = simd_sum(lane_sum);
     float inv_sum = 1.0f / row_sum_exp;
 
-    // Pass 3: write grad. softmax(logits)[j] = exp(logits[j] - max) / sum_exp.
-    // grad[j] = (softmax[j] - 1{j == label}) / N  * upstream
+    // Pass 3: write grad.
     for (uint i = lane; i < (uint)V; i += 32u) {
-        float v = logits[row_off + i];
+        float v = float(logits[row_off + i]);
         float sm = exp(v - row_max) * inv_sum;
         float indicator = ((int)i == label_idx) ? 1.0f : 0.0f;
-        grad[row_off + i] = (sm - indicator) * inv_N * upstream;
+        grad[row_off + i] = T((sm - indicator) * inv_N * upstream);
     }
 """
 
-_ce_bwd_kernel = None
+_ce_bwd_kernels: dict = {}
 
 
-def _get_ce_bwd_kernel():
-    global _ce_bwd_kernel
-    if _ce_bwd_kernel is None:
-        _ce_bwd_kernel = mx.fast.metal_kernel(
-            name="metalgrad_cross_entropy_bwd",
+def _get_ce_bwd_kernel(dtype):
+    k = _ce_bwd_kernels.get(dtype)
+    if k is None:
+        k = mx.fast.metal_kernel(
+            name=f"metalgrad_cross_entropy_bwd_{str(dtype).split('.')[-1]}",
             input_names=["logits", "labels", "gy_arr"],
             output_names=["grad"],
             source=_CE_BWD_SRC,
         )
-    return _ce_bwd_kernel
+        _ce_bwd_kernels[dtype] = k
+    return k
 
 
 def _cross_entropy_grad_fast(logits: mx.array, labels: mx.array,
                               gy: mx.array) -> mx.array:
     N, V = logits.shape
-    kernel = _get_ce_bwd_kernel()
+    kernel = _get_ce_bwd_kernel(logits.dtype)
     gy_arr = gy.reshape((1,)) if gy.ndim == 0 else gy
     (grad,) = kernel(
         inputs=[logits, labels, gy_arr],
-        template=[("V", V), ("N_ROWS", N)],
+        template=[("V", V), ("N_ROWS", N), ("T", logits.dtype)],
         grid=(32, N, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(N, V)],

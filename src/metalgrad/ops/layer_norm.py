@@ -17,67 +17,64 @@ from metalgrad.differentiable import differentiable
 
 
 _LN_FWD_SRC = """
-    // Same float4 striped layout as rms_norm. C must be divisible by 128.
+    // One SIMD per row, striped scalar layout. C % 32 == 0.
+    // Accumulate in float, cast to T on write (dtype-agnostic).
     uint row = thread_position_in_grid.y;
     uint lane = thread_position_in_threadgroup.x;
     if (row >= N_ROWS) return;
 
-    constexpr int N_ITERS_F4 = (int)C / 128;
-    uint row_base_f4 = row * (uint)(C / 4);
-    float eps = eps_arr[0];
+    constexpr int N_ITERS = (int)C / 32;
+    uint row_base = row * (uint)C;
+    float eps = float(eps_arr[0]);
 
-    const device float4* x_v4 = (const device float4*)x;
-    const device float4* w_v4 = (const device float4*)weight;
-    const device float4* b_v4 = (const device float4*)bias;
-    device float4* y_v4 = (device float4*)y;
-
-    float4 xs[N_ITERS_F4];
+    float xs[N_ITERS];
     float lane_sum = 0.0f;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_ITERS_F4; ++i) {
-        uint idx = (uint)(i * 32) + lane;
-        float4 v = x_v4[row_base_f4 + idx];
+    for (int i = 0; i < N_ITERS; ++i) {
+        uint cidx = (uint)(i * 32) + lane;
+        float v = float(x[row_base + cidx]);
         xs[i] = v;
-        lane_sum += v.x + v.y + v.z + v.w;
+        lane_sum += v;
     }
     float mean = simd_sum(lane_sum) / float(C);
 
     float lane_sq = 0.0f;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_ITERS_F4; ++i) {
-        float4 d = xs[i] - mean;
-        lane_sq += dot(d, d);
+    for (int i = 0; i < N_ITERS; ++i) {
+        float d = xs[i] - mean;
+        lane_sq = fma(d, d, lane_sq);
     }
     float inv = rsqrt(simd_sum(lane_sq) / float(C) + eps);
 
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_ITERS_F4; ++i) {
-        uint idx = (uint)(i * 32) + lane;
-        float4 wv = w_v4[idx];
-        float4 bv = b_v4[idx];
-        y_v4[row_base_f4 + idx] = (xs[i] - mean) * inv * wv + bv;
+    for (int i = 0; i < N_ITERS; ++i) {
+        uint cidx = (uint)(i * 32) + lane;
+        float result = (xs[i] - mean) * inv * float(weight[cidx]) + float(bias[cidx]);
+        y[row_base + cidx] = T(result);
     }
 """
 
 _ln_kernels: dict = {}
 
 
-def _get_ln_kernel(C: int):
-    k = _ln_kernels.get(C)
+def _get_ln_kernel(C: int, dtype):
+    key = (C, dtype)
+    k = _ln_kernels.get(key)
     if k is None:
         k = mx.fast.metal_kernel(
-            name=f"metalgrad_layer_norm_fwd_C{C}",
+            name=f"metalgrad_layer_norm_fwd_C{C}_{str(dtype).split('.')[-1]}",
             input_names=["x", "weight", "bias", "eps_arr"],
             output_names=["y"],
             source=_LN_FWD_SRC,
         )
-        _ln_kernels[C] = k
+        _ln_kernels[key] = k
     return k
 
 
 def _layer_norm_fast(x: mx.array, weight: mx.array, bias: mx.array,
                      eps: float) -> mx.array:
-    """Fused fast forward — requires C % 32 == 0."""
+    """Fused fast forward — requires C % 32 == 0. Dtype-agnostic
+    (FP32 / FP16 / BF16 all work, internal accumulation in float)."""
     C = x.shape[-1]
     orig_shape = x.shape
     n_rows = 1
@@ -85,10 +82,10 @@ def _layer_norm_fast(x: mx.array, weight: mx.array, bias: mx.array,
         n_rows *= d
     x_flat = x.reshape(n_rows, C)
     eps_arr = mx.array([float(eps)], dtype=x.dtype)
-    kernel = _get_ln_kernel(C)
+    kernel = _get_ln_kernel(C, x.dtype)
     (y_flat,) = kernel(
         inputs=[x_flat, weight, bias, eps_arr],
-        template=[("C", C), ("N_ROWS", n_rows)],
+        template=[("C", C), ("N_ROWS", n_rows), ("T", x.dtype)],
         grid=(32, n_rows, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(n_rows, C)],
@@ -111,7 +108,7 @@ def _layer_norm_ref(x: mx.array, weight: mx.array, bias: mx.array,
                     eps: float) -> mx.array:
     """Forward dispatch: fast Metal kernel where supported, else mx."""
     C = x.shape[-1]
-    if C % 128 == 0 and x.ndim >= 2:
+    if C % 32 == 0 and x.ndim >= 2:
         return _layer_norm_fast(x, weight, bias, float(eps))
     return _layer_norm_mx(x, weight, bias, eps)
 

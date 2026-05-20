@@ -58,7 +58,7 @@ _ADALN_FWD_SRC = """
     #pragma clang loop unroll(full)
     for (int i = 0; i < N_ITERS; ++i) {
         uint cidx = (uint)(i * 32) + lane;
-        float v = x[row_base + cidx];
+        float v = float(x[row_base + cidx]);
         xs[i] = v;
         lane_sum += v;
     }
@@ -73,29 +73,33 @@ _ADALN_FWD_SRC = """
     }
     float inv = rsqrt(simd_sum(lane_sq) / float(C) + eps);
 
-    // Write y = norm * (1 + scale[batch, c]) + shift[batch, c].
+    // Write y = norm * (1 + scale[batch, c]) + shift[batch, c]. Cast to T
+    // explicitly so BF16/FP16 outputs work (Metal won't implicitly
+    // convert float -> bfloat16_t on store).
     #pragma clang loop unroll(full)
     for (int i = 0; i < N_ITERS; ++i) {
         uint cidx = (uint)(i * 32) + lane;
-        float sc = scale[scale_base + cidx];
-        float sh = shift[scale_base + cidx];
-        y[row_base + cidx] = (xs[i] - mean) * inv * (1.0f + sc) + sh;
+        float sc = float(scale[scale_base + cidx]);
+        float sh = float(shift[scale_base + cidx]);
+        float result = (xs[i] - mean) * inv * (1.0f + sc) + sh;
+        y[row_base + cidx] = T(result);
     }
 """
 
 _adaln_kernels: dict = {}
 
 
-def _get_adaln_kernel(C: int):
-    k = _adaln_kernels.get(C)
+def _get_adaln_kernel(C: int, dtype):
+    key = (C, dtype)
+    k = _adaln_kernels.get(key)
     if k is None:
         k = mx.fast.metal_kernel(
-            name=f"metalgrad_adaln_fwd_C{C}",
+            name=f"metalgrad_adaln_fwd_C{C}_{str(dtype).split('.')[-1]}",
             input_names=["x", "scale", "shift", "eps_arr"],
             output_names=["y"],
             source=_ADALN_FWD_SRC,
         )
-        _adaln_kernels[C] = k
+        _adaln_kernels[key] = k
     return k
 
 
@@ -112,10 +116,10 @@ def _adaln_fast(x: mx.array, scale: mx.array, shift: mx.array,
     n_rows = B * R_total
     x_flat = x.reshape(n_rows, C)
     eps_arr = mx.array([float(eps)], dtype=x.dtype)
-    kernel = _get_adaln_kernel(C)
+    kernel = _get_adaln_kernel(C, x.dtype)
     (y_flat,) = kernel(
         inputs=[x_flat, scale, shift, eps_arr],
-        template=[("C", C), ("R", R_total), ("N_ROWS", n_rows)],
+        template=[("C", C), ("R", R_total), ("N_ROWS", n_rows), ("T", x.dtype)],
         grid=(32, n_rows, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(n_rows, C)],
