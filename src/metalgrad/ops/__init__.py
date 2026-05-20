@@ -29,6 +29,8 @@ from metalgrad.ops.rope import (
     rope_freqs_yarn, rope_freqs_llama3,
     rope_standard, rope_linear_pi, rope_ntk_aware, rope_yarn, rope_llama3,
 )
+from metalgrad.ops.adaln import adaln
+from metalgrad.ops.optim import adamw_step, ema_update, clip_grad_norm
 
 __all__ = [
     "matmul", "rms_norm",
@@ -42,4 +44,6 @@ __all__ = [
     "rope_freqs_yarn", "rope_freqs_llama3",
     "rope_standard", "rope_linear_pi", "rope_ntk_aware",
     "rope_yarn", "rope_llama3",
+    "adaln",
+    "adamw_step", "ema_update", "clip_grad_norm",
 ]

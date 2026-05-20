@@ -58,6 +58,10 @@ from metalgrad.ops import (
 | **`cross_entropy`** | 0.65×‡ | **1.76×** | one-pass online softmax (Welford-style) forward + streaming fused-grad backward; **fwd + bwd combined 1.88×** |
 | **`kl_div_logits`** | **3.35×** | (combined fwd+bwd **3.39×**) | two parallel online-softmax passes (pred & target) in one kernel + streaming fused-grad backward writing `(softmax(pred) − softmax(target))/N` directly |
 | **`mse`** | parity | parity | `mx.compile`-fused `mean((p − t)²)` with closed-form `2(p − t)/N` VJP — useful as named API for regression / diffusion training |
+| **`adaln`** | **1.8–6.0×** | (via `mx.vjp`) | affineless LayerNorm + `(1 + scale[batch, c]) · norm + shift[batch, c]` — DiT / FCDM block's per-batch modulation. Win grows with model size: DiT-XL `(B=4, T=1024, C=1152)` hits 5.95× |
+| **`adamw_step`** | **3.80×** (per-tensor) | — (no VJP; optimizer kernel) | fused AdamW: `(param, grad, m, v) → (new_param, new_m, new_v)` in one pass. Every training step uses this |
+| `ema_update` | parity | — | `α · ema + (1 − α) · param`. `mx.compile` already fuses; shipped as named API |
+| `clip_grad_norm` | (small bench win) | — | global L2 norm over a list of grad tensors + scale. One pass per grad tensor |
 | `matmul`, `conv1d`, `conv2d`, `depthwise_conv2d` | 1.0× | 1.0× | thin re-exports — mx is already MPSGraph-tuned with `simdgroup_matrix` MMA |
 | `attention` | 1.0× | 1.0× | thin re-export — `mx.fast.scaled_dot_product_attention` is already FlashAttention-style (1.6–3.9× over manual SDPA) |
 | `rope_standard` / `rope_linear_pi` / `rope_ntk_aware` / `rope_yarn` / `rope_llama3` | 2.9× (via `mx.fast.rope`) | autograd via mx | thin wrappers around `mx.fast.rope`; each variant supplies a different frequency table to the same underlying fused rotation kernel |
@@ -200,7 +204,7 @@ from metalgrad.testing import gradcheck
 gradcheck(lambda x, w: mx.sum(my_op(x, w) ** 2), [x, w], rtol=5e-2)
 ```
 
-The 32 tests in `tests/test_gradcheck.py` cover both finite-difference
+The 34 tests in `tests/test_gradcheck.py` cover both finite-difference
 checks (against autograd) and direct VJP-vs-reference checks (against
 `mx.grad` of an mx-only reference forward, requiring FP32 bit-precise
 agreement at `rel_err < 1e-5`).

@@ -18,6 +18,7 @@ from metalgrad.ops import (
     matmul, rms_norm, conv1d, conv2d, depthwise_conv2d, layer_norm, attention,
     swiglu, geglu, squared_relu, cross_entropy, mse, kl_div_logits,
     rope_standard, rope_llama3, rope_yarn,
+    adaln,
 )
 from metalgrad.testing import gradcheck
 
@@ -438,6 +439,43 @@ def test_kl_div_grad_vs_ref():
 
 # ─── rope variants (correctness only; no grad win to test) ───────────────────
 
+def _adaln_mx_ref(x, scale, shift, eps=1e-5):
+    s = scale[:, None, :]; sh = shift[:, None, :]
+    m = mx.mean(x, axis=-1, keepdims=True)
+    v = mx.mean((x - m) ** 2, axis=-1, keepdims=True)
+    return (x - m) * mx.rsqrt(v + eps) * (1 + s) + sh
+
+
+def test_adaln_value_vs_ref():
+    B, T, C = 2, 16, 64
+    rng = np.random.default_rng(70)
+    x = mx.array((rng.standard_normal((B, T, C)) * 0.3).astype(np.float32))
+    sc = mx.array((rng.standard_normal((B, C)) * 0.2).astype(np.float32))
+    sh = mx.array((rng.standard_normal((B, C)) * 0.1).astype(np.float32))
+    y_o = adaln(x, sc, sh, 1e-5)
+    y_r = _adaln_mx_ref(x, sc, sh, 1e-5)
+    mx.eval(y_o, y_r)
+    rel = float(mx.abs(y_o - y_r).max()) / max(float(mx.abs(y_r).max()), 1e-9)
+    assert rel < 1e-5, f"adaln value rel err {rel:.2e}"
+
+
+def test_adaln_grad_vs_ref():
+    B, T, C = 2, 8, 64
+    rng = np.random.default_rng(71)
+    x = mx.array((rng.standard_normal((B, T, C)) * 0.3).astype(np.float32))
+    sc = mx.array((rng.standard_normal((B, C)) * 0.2).astype(np.float32))
+    sh = mx.array((rng.standard_normal((B, C)) * 0.1).astype(np.float32))
+
+    def ours(x, sc, sh): return mx.sum(adaln(x, sc, sh, 1e-5) ** 2)
+    def ref(x, sc, sh):  return mx.sum(_adaln_mx_ref(x, sc, sh, 1e-5) ** 2)
+    g_o = mx.grad(ours, argnums=(0, 1, 2))(x, sc, sh)
+    g_r = mx.grad(ref,  argnums=(0, 1, 2))(x, sc, sh)
+    mx.eval(*g_o, *g_r)
+    for i, name in enumerate(["x", "scale", "shift"]):
+        rel = float(mx.abs(g_o[i] - g_r[i]).max()) / max(float(mx.abs(g_r[i]).max()), 1e-9)
+        assert rel < 1e-5, f"adaln g{name} rel err {rel:.2e}"
+
+
 def test_rope_variants_finite():
     """Just check the new RoPE variants produce finite outputs of the
     expected shape. The math equivalence to mx.fast.rope with the right
@@ -487,4 +525,6 @@ if __name__ == "__main__":
     test_kl_div_value_vs_ref()
     test_kl_div_grad_vs_ref()
     test_rope_variants_finite()
+    test_adaln_value_vs_ref()
+    test_adaln_grad_vs_ref()
     print("ALL PASS")
